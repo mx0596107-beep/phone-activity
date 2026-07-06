@@ -15,15 +15,26 @@ DB_PATH = os.environ.get("DATA_DIR", "/tmp") + "/activity.db"
 
 
 def get_db():
+    
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS phone_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT NOT NULL,
-            opened_at TEXT NOT NULL
+            opened_at TEXT NOT NULL,
+            battery TEXT,
+            clipboard TEXT,
+            music TEXT,
+            location TEXT
         )
     """)
+    # 老表兼容：如果之前建过没有新列的表，逐个补上（已存在会报错，忽略即可）
+    for col in ("battery", "clipboard", "music", "location"):
+        try:
+            conn.execute(f"ALTER TABLE phone_activity ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
@@ -46,12 +57,18 @@ def report():
 
     data = request.get_json(silent=True) or {}
     app_name = data.get("app_name") or data.get("app") or "unknown"
+    battery = data.get("battery") or data.get("电池电量")
+    clipboard = data.get("clipboard") or data.get("剪贴板")
+    music = data.get("music")
+    location = data.get("location") or data.get("定位")
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO phone_activity (app_name, opened_at) VALUES (?, ?)",
-        (app_name, now),
+        """INSERT INTO phone_activity
+           (app_name, opened_at, battery, clipboard, music, location)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (app_name, now, battery, clipboard, music, location),
     )
     # 小本本只留最近 100 条，旧的自动删掉
     conn.execute("""
@@ -73,22 +90,31 @@ def activity():
 
     conn = get_db()
     rows = conn.execute(
-        "SELECT app_name, opened_at FROM phone_activity ORDER BY opened_at DESC LIMIT 100"
+        """SELECT app_name, opened_at, battery, clipboard, music, location
+           FROM phone_activity ORDER BY opened_at DESC LIMIT 100"""
     ).fetchall()
     conn.close()
-    return jsonify([{"app": r["app_name"], "time": r["opened_at"]} for r in rows])
+    return jsonify([{
+        "app": r["app_name"],
+        "time": r["opened_at"],
+        "battery": r["battery"],
+        "clipboard": r["clipboard"],
+        "music": r["music"],
+        "location": r["location"],
+    } for r in rows])
 
 
 @app.route("/activity/summary", methods=["GET"])
 def activity_summary():
-    """聚合一下：最后活跃时间 + 最近用过的 App。"""
+    """聚合一下：最后活跃时间 + 最近用过的 App + 最新一次的电池/音乐。"""
     err = require_token()
     if err:
         return err
 
     conn = get_db()
     rows = conn.execute(
-        "SELECT app_name, opened_at FROM phone_activity ORDER BY opened_at DESC LIMIT 100"
+        """SELECT app_name, opened_at, battery, clipboard, music, location
+           FROM phone_activity ORDER BY opened_at DESC LIMIT 100"""
     ).fetchall()
     conn.close()
 
@@ -97,7 +123,14 @@ def activity_summary():
 
     last_active = rows[0]["opened_at"]
     recent_apps = list(dict.fromkeys(r["app_name"] for r in rows[:10]))
-    return jsonify({"last_active": last_active, "recent_apps": recent_apps, "count": len(rows)})
+    return jsonify({
+        "last_active": last_active,
+        "recent_apps": recent_apps,
+        "count": len(rows),
+        "latest_battery": rows[0]["battery"],
+        "latest_music": rows[0]["music"],
+        "latest_location": rows[0]["location"],
+    })
 
 
 @app.route("/ping", methods=["GET"])
