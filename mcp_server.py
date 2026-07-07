@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""手机活动上报 + 偷看屏幕。用 Python 标准库做 HTTP，不依赖 fastmcp 路由。"""
+"""手机活动上报 + 偷看屏幕。只用 Python 标准库，不依赖 flask/fastmcp。"""
 
 import sqlite3
 import os
