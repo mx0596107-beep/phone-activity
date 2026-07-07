@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""手机活动上报 + 偷看屏幕。只用 Python 标准库，不依赖 flask/fastmcp。"""
+"""手机活动上报 + 偷看屏幕 + 触发发信。只用 Python 标准库 + smtplib。"""
 
 import sqlite3
 import os
 import glob
 import cgi
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,6 +16,10 @@ DB_PATH = DATA_DIR + "/activity.db"
 PEEK_SECRET = os.environ.get("PEEK_SECRET", "momo0605")
 SCREEN_DIR = DATA_DIR + "/screens"
 os.makedirs(SCREEN_DIR, exist_ok=True)
+
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_PASS = os.environ.get("GMAIL_PASS", "")
+ICLOUD_TO = os.environ.get("ICLOUD_TO", "momw_0605@icloud.com")
 
 
 def get_db():
@@ -42,6 +48,16 @@ def save_screenshot(data: bytes):
     return name
 
 
+def send_peek_mail():
+    msg = MIMEText("peek the screen", "plain", "utf-8")
+    msg["Subject"] = "peek"
+    msg["From"] = GMAIL_USER
+    msg["To"] = ICLOUD_TO
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(GMAIL_USER, GMAIL_PASS)
+        s.sendmail(GMAIL_USER, [ICLOUD_TO], msg.as_string())
+
+
 def report_activity(app_name: str):
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
@@ -67,6 +83,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        qs = self.path.split("?")[1] if "?" in self.path else ""
         if path == "/" or path == "/health":
             self._send(200, "ok".encode())
         elif path == "/latest":
@@ -76,6 +93,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(files[0], "rb") as f:
                 self._send(200, f.read(), "image/png")
+        elif path == "/peek-trigger":
+            if f"secret={PEEK_SECRET}" not in qs:
+                self._send(403, "forbidden".encode())
+                return
+            try:
+                send_peek_mail()
+                self._send(200, "邮件已发送，等手机自动截屏".encode())
+            except Exception as e:
+                self._send(500, ("发信失败: " + str(e)).encode())
         else:
             self._send(404, "not found".encode())
 
