@@ -1,142 +1,116 @@
 #!/usr/bin/env python3
-"""手机活动上报服务：收 iOS 快捷指令的 POST，存 SQLite 小本本。"""
+"""手机活动上报 + 偷看屏幕。只用 Python 标准库，不依赖 flask/fastmcp。"""
 
-import os
 import sqlite3
+import os
+import glob
+import cgi
 from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from flask import Flask, request, jsonify
-
-app = Flask(__name__)
-
-CST = timezone(timedelta(hours=8))  # 北京时间
-EXPECTED_TOKEN = os.environ.get("REPORT_TOKEN", "")  # 部署时设一个随机串当密码
-DB_PATH = os.environ.get("DATA_DIR", "/tmp") + "/activity.db"
+CST = timezone(timedelta(hours=8))
+DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
+DB_PATH = DATA_DIR + "/activity.db"
+PEEK_SECRET = os.environ.get("PEEK_SECRET", "momo0605")
+SCREEN_DIR = DATA_DIR + "/screens"
+os.makedirs(SCREEN_DIR, exist_ok=True)
 
 
 def get_db():
-    
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS phone_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT NOT NULL,
-            opened_at TEXT NOT NULL,
-            battery TEXT,
-            clipboard TEXT,
-            music TEXT,
-            location TEXT
+            opened_at TEXT NOT NULL
         )
     """)
-    # 老表兼容：如果之前建过没有新列的表，逐个补上（已存在会报错，忽略即可）
-    for col in ("battery", "clipboard", "music", "location"):
-        try:
-            conn.execute(f"ALTER TABLE phone_activity ADD COLUMN {col} TEXT")
-        except sqlite3.OperationalError:
-            pass
     return conn
 
 
-def require_token():
-    """没设密码就不查；设了就必须带对的 Bearer。"""
-    if not EXPECTED_TOKEN:
-        return None
-    auth = request.headers.get("Authorization", "")
-    token = auth.replace("Bearer ", "").strip()
-    if token != EXPECTED_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-    return None
+def save_screenshot(data: bytes):
+    name = datetime.now(CST).strftime("%Y%m%d_%H%M%S_%f") + ".png"
+    with open(os.path.join(SCREEN_DIR, name), "wb") as f:
+        f.write(data)
+    files = sorted(glob.glob(os.path.join(SCREEN_DIR, "*.png")), reverse=True)
+    for old in files[5:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return name
 
 
-@app.route("/report", methods=["POST"])
-def report():
-    err = require_token()
-    if err:
-        return err
-
-    data = request.get_json(silent=True) or {}
-    app_name = data.get("app_name") or data.get("app") or "unknown"
-    battery = data.get("battery") or data.get("电池电量")
-    clipboard = data.get("clipboard") or data.get("剪贴板")
-    music = data.get("music")
-    location = data.get("location") or data.get("定位")
+def report_activity(app_name: str):
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-
     conn = get_db()
-    conn.execute(
-        """INSERT INTO phone_activity
-           (app_name, opened_at, battery, clipboard, music, location)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (app_name, now, battery, clipboard, music, location),
-    )
-    # 小本本只留最近 100 条，旧的自动删掉
+    conn.execute("INSERT INTO phone_activity (app_name, opened_at) VALUES (?, ?)", (app_name, now))
     conn.execute("""
-        DELETE FROM phone_activity
-        WHERE id NOT IN (
+        DELETE FROM phone_activity WHERE id NOT IN (
             SELECT id FROM phone_activity ORDER BY opened_at DESC LIMIT 100
         )
     """)
     conn.commit()
     conn.close()
-    return jsonify({"status": "ok"})
+    return now
 
 
-@app.route("/activity", methods=["GET"])
-def activity():
-    err = require_token()
-    if err:
-        return err
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
 
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT app_name, opened_at, battery, clipboard, music, location
-           FROM phone_activity ORDER BY opened_at DESC LIMIT 100"""
-    ).fetchall()
-    conn.close()
-    return jsonify([{
-        "app": r["app_name"],
-        "time": r["opened_at"],
-        "battery": r["battery"],
-        "clipboard": r["clipboard"],
-        "music": r["music"],
-        "location": r["location"],
-    } for r in rows])
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/" or path == "/health":
+            self._send(200, "ok".encode())
+        elif path == "/latest":
+            files = sorted(glob.glob(os.path.join(SCREEN_DIR, "*.png")), reverse=True)
+            if not files:
+                self._send(404, "还没有截图".encode())
+                return
+            with open(files[0], "rb") as f:
+                self._send(200, f.read(), "image/png")
+        else:
+            self._send(404, "not found".encode())
 
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        qs = self.path.split("?")[1] if "?" in self.path else ""
+        if path == "/peek":
+            if f"secret={PEEK_SECRET}" not in qs:
+                self._send(403, "forbidden".encode())
+                return
+            ctype = self.headers.get("Content-Type", "")
+            form = cgi.FieldStorage(
+                fp=self.rfile, headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+            )
+            if "image" not in form:
+                self._send(400, "no image".encode())
+                return
+            data = form["image"].file.read()
+            name = save_screenshot(data)
+            self._send(200, ("saved: " + name).encode())
+        elif path == "/report":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode()
+            app_name = body.strip() or "unknown"
+            now = report_activity(app_name)
+            self._send(200, ("已记录: " + app_name + " @ " + now).encode())
+        else:
+            self._send(404, "not found".encode())
 
-@app.route("/activity/summary", methods=["GET"])
-def activity_summary():
-    """聚合一下：最后活跃时间 + 最近用过的 App + 最新一次的电池/音乐。"""
-    err = require_token()
-    if err:
-        return err
-
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT app_name, opened_at, battery, clipboard, music, location
-           FROM phone_activity ORDER BY opened_at DESC LIMIT 100"""
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        return jsonify({"last_active": None, "recent_apps": [], "count": 0})
-
-    last_active = rows[0]["opened_at"]
-    recent_apps = list(dict.fromkeys(r["app_name"] for r in rows[:10]))
-    return jsonify({
-        "last_active": last_active,
-        "recent_apps": recent_apps,
-        "count": len(rows),
-        "latest_battery": rows[0]["battery"],
-        "latest_music": rows[0]["music"],
-        "latest_location": rows[0]["location"],
-    })
-
-
-@app.route("/ping", methods=["GET"])
-def ping():
-    return jsonify({"status": "ok"})
+    def log_message(self, *args):
+        pass
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+    print("server started on 8080", flush=True)
+    server.serve_forever()
